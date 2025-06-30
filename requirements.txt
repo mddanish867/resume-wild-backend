@@ -1,0 +1,8 @@
+flask
+flask_sqlalchemy
+flask_cors
+python-docx
+pdfkit
+transformers
+openai
+psycopg2-binary
