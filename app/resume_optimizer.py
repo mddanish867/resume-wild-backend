@@ -1,129 +1,166 @@
 import os
 import re
-from transformers import DistilBertTokenizer, DistilBertForMaskedLM, BertTokenizer, BertForMaskedLM
-from transformers import pipeline
-from nltk.tokenize import sent_tokenize, word_tokenize
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
-import docx
-import nltk
+from collections import defaultdict
+from transformers import pipeline, DistilBertTokenizer, DistilBertForMaskedLM
+from nltk.tokenize import sent_tokenize
+from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
 import logging
+from functools import lru_cache
+import nltk
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+nltk.download("punkt")
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Safe download of 'punkt_tab' if not present
-try:
-    nltk.data.find("tokenizers/punkt_tab")
-except LookupError:
-    logger.info("Downloading NLTK punkt_tab resource...")
-    nltk.download("punkt_tab")
-
-# Model configuration
-MODEL_NAME = os.getenv("MODEL_NAME", "distilbert-base-uncased")  # Allow model name to be set via environment variable
-
-# Initialize tokenizer and model
-try:
-    if "distilbert" in MODEL_NAME.lower():
-        tokenizer = DistilBertTokenizer.from_pretrained(MODEL_NAME)
-        model = DistilBertForMaskedLM.from_pretrained(MODEL_NAME)
-    elif "bert" in MODEL_NAME.lower():
-        tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
-        model = BertForMaskedLM.from_pretrained(MODEL_NAME)
-    else:
-        raise ValueError(f"Model {MODEL_NAME} not supported. Choose 'distilbert-base-uncased' or 'bert-base-uncased'.")
-except Exception as e:
-    logger.error(f"Failed to load model or tokenizer: {e}")
-    raise
-
+# Initialize model
+MODEL_NAME = "distilbert-base-uncased"
+tokenizer = DistilBertTokenizer.from_pretrained(MODEL_NAME)
+model = DistilBertForMaskedLM.from_pretrained(MODEL_NAME)
 fill_mask = pipeline(task="fill-mask", model=model, tokenizer=tokenizer)
 
-def extract_text_from_docx(path):
-    """Extract text from a .docx file."""
-    if not os.path.exists(path):
-        logger.error(f"Document not found: {path}")
-        raise FileNotFoundError(f"Document not found: {path}")
-    try:
-        doc = docx.Document(path)
-        text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-        if not text:
-            logger.warning(f"No text extracted from document: {path}")
-        return text
-    except Exception as e:
-        logger.error(f"Error reading .docx file {path}: {e}")
-        raise
+def is_url(text):
+    return bool(re.search(r"(http[s]?://|www\.)\S+", text))
 
-def extract_keywords(text, top_k=10):
-    """Extract top-k keywords from text, excluding stop words."""
-    if not text or not isinstance(text, str):
-        logger.error("Invalid input for keyword extraction: text must be a non-empty string")
-        return []
+def clean_text(text):
+    return re.sub(r'\s+', ' ', text).strip()
+
+@lru_cache(maxsize=500)
+def get_mask_predictions(masked_sentence, top_k=5):
     try:
-        words = [w.lower() for w in word_tokenize(text) if w.isalnum() and w.lower() not in ENGLISH_STOP_WORDS]
-        freq = {}
-        for word in words:
-            freq[word] = freq.get(word, 0) + 1
-        sorted_words = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-        return [w for w, _ in sorted_words[:top_k]]
-    except Exception as e:
-        logger.error(f"Error extracting keywords: {e}")
+        predictions = fill_mask(masked_sentence, top_k=top_k)
+        return [pred['token_str'].replace("##", "").strip() for pred in predictions]
+    except:
         return []
 
-def preserve_case(original_word, replacement_word):
-    """Preserve the case of the original word in the replacement."""
-    if original_word.isupper():
-        return replacement_word.upper()
-    elif original_word.istitle():
-        return replacement_word.capitalize()
-    elif original_word.islower():
-        return replacement_word.lower()
-    return replacement_word
+def extract_keywords(text, top_k=100):
+    vectorizer = CountVectorizer(
+        ngram_range=(1, 2),
+        stop_words=list(ENGLISH_STOP_WORDS),
+        max_features=top_k * 2
+    )
+    matrix = vectorizer.fit_transform([text])
+    keywords = zip(vectorizer.get_feature_names_out(), matrix.sum(axis=0).tolist()[0])
+    return [w for w, _ in sorted(keywords, key=lambda x: x[1], reverse=True) if len(w) > 1]
 
-def optimize_resume(resume_text, job_description):
-    """Optimize resume text by replacing keywords with model predictions."""
-    if not resume_text or not job_description:
-        logger.error("Resume text or job description is empty")
-        return resume_text
+def preserve_case(original, replacement):
+    if original.isupper():
+        return replacement.upper()
+    elif original.istitle():
+        return replacement.capitalize()
+    else:
+        return replacement.lower()
 
-    try:
-        # Tokenize resume into sentences
-        resume_sentences = sent_tokenize(resume_text)
-        if not resume_sentences:
-            logger.warning("No sentences found in resume text")
-            return resume_text
+def segment_resume_sections(resume_text):
+    sections = defaultdict(str)
+    current_section = "general"
+    for line in resume_text.splitlines():
+        if "overview" in line.lower() or "summary" in line.lower():
+            current_section = "overview"
+        elif "skills" in line.lower():
+            current_section = "skills"
+        elif "experience" in line.lower():
+            current_section = "experience"
+        elif line.strip() == "":
+            continue
+        sections[current_section] += line.strip() + " "
+    return sections
 
-        # Extract keywords once, outside the loop
-        keywords = extract_keywords(job_description)
-        if not keywords:
-            logger.warning("No keywords extracted from job description")
-            return resume_text
+def optimize_resume(resume_text, job_description, replacement_threshold=0.5):
+    resume_text = clean_text(resume_text)
+    jd_text = clean_text(job_description)
 
-        enhanced_resume = []
-        for sentence in resume_sentences:
-            optimized = sentence
-            for word in keywords:
-                # Check if the word exists in the sentence (case-insensitive)
-                pattern = rf"\b{re.escape(word)}\b"
-                if re.search(pattern, sentence, flags=re.IGNORECASE):
-                    # Find all matches to preserve their original case
-                    matches = re.finditer(pattern, sentence, flags=re.IGNORECASE)
-                    for match in matches:
-                        original_word = match.group(0)
-                        masked = re.sub(pattern, "[MASK]", sentence, flags=re.IGNORECASE, count=1)
-                        try:
-                            prediction = fill_mask(masked)
-                            if prediction and isinstance(prediction, list) and len(prediction) > 0:
-                                best_word = prediction[0]['token_str']
-                                # Preserve the case of the original word
-                                best_word = preserve_case(original_word, best_word)
-                                optimized = re.sub(pattern, best_word, optimized, flags=re.IGNORECASE, count=1)
-                            else:
-                                logger.warning(f"No valid prediction for masked word: {word}")
-                        except Exception as e:
-                            logger.error(f"Masking failed for word '{word}' in sentence '{sentence}': {e}")
-            enhanced_resume.append(optimized)
+    jd_keywords = extract_keywords(jd_text, top_k=100)
+    resume_keywords = extract_keywords(resume_text, top_k=100)
 
-        return "\n".join(enhanced_resume)
-    except Exception as e:
-        logger.error(f"Error optimizing resume: {e}")
-        return resume_text  # Return original text as fallback
+    missing_keywords = [kw for kw in jd_keywords if kw not in resume_keywords]
+
+    logger.info(f"Missing JD Keywords: {missing_keywords}")
+
+    sections = segment_resume_sections(resume_text)
+    updated_resume = []
+    change_log = []
+
+    # 1. Optimize Overview
+    if sections["overview"]:
+        summary_sentences = sent_tokenize(sections["overview"])
+        enriched = set()
+        for kw in missing_keywords:
+            for i, sent in enumerate(summary_sentences):
+                if kw in sent or is_url(sent):
+                    continue
+                if "[MASK]" not in sent and len(sent.split()) > 4:
+                    tokens = sent.split()
+                    middle = len(tokens) // 2
+                    masked = " ".join(tokens[:middle]) + " [MASK] " + " ".join(tokens[middle:])
+                    predictions = get_mask_predictions(masked)
+                    if predictions:
+                        enriched.add(kw)
+                        summary_sentences[i] = sent + f" Skilled in {kw}."
+                        change_log.append(f"Added '{kw}' to summary.")
+                        break
+        sections["overview"] = " ".join(summary_sentences)
+
+    # 2. Optimize Skills section
+    if sections["skills"]:
+        existing_skills = set(re.split(r",|\n|;", sections["skills"]))
+        new_skills = [kw for kw in missing_keywords if kw not in existing_skills]
+        if new_skills:
+            sections["skills"] = sections["skills"].strip().rstrip(".") + ", " + ", ".join(new_skills) + "."
+            change_log.append(f"Added new skills: {new_skills}")
+
+    # 3. Optimize Experience
+    if sections["experience"]:
+        experience_sentences = sent_tokenize(sections["experience"])
+        for i, sent in enumerate(experience_sentences):
+            if is_url(sent):
+                continue
+            for kw in missing_keywords:
+                if kw in sent:
+                    continue
+                if "[MASK]" not in sent:
+                    mid = len(sent.split()) // 2
+                    tokens = sent.split()
+                    masked = " ".join(tokens[:mid]) + " [MASK] " + " ".join(tokens[mid:])
+                    preds = get_mask_predictions(masked)
+                    if preds and kw not in sent:
+                        experience_sentences[i] += f" Worked on {kw}."
+                        change_log.append(f"Added '{kw}' to experience.")
+                        break
+        sections["experience"] = " ".join(experience_sentences)
+
+    # 4. Rebuild updated resume
+    for sec in ["overview", "skills", "experience", "general"]:
+        if sections[sec]:
+            updated_resume.append(f"\n--- {sec.upper()} ---\n{sections[sec]}")
+
+    logger.info("Resume optimization complete.")
+    return "\n".join(updated_resume).strip(), change_log
+
+# === Example Usage ===
+if __name__ == "__main__":
+    sample_resume = """
+    OVERVIEW
+    Experienced software developer with 5 years of experience in Python and Java.
+
+    SKILLS
+    Python, Java, Git
+
+    EXPERIENCE
+    Developed machine learning models for predictive analytics.
+    Strong background in data structures and algorithms.
+    """
+
+    sample_jd = """
+    Looking for an experienced Python developer familiar with TensorFlow, data pipelines,
+    model deployment, neural networks, cloud platforms like AWS or Azure, and containerization tools.
+    Must have experience in CI/CD, Docker, and Kubernetes.
+    """
+
+    optimized_resume, changes = optimize_resume(sample_resume, sample_jd)
+    print("\n=== Optimized Resume ===\n")
+    print(optimized_resume)
+    print("\n=== Modifications Done ===\n")
+    for c in changes:
+        print(f"- {c}")

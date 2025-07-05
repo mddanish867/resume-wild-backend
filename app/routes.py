@@ -1,11 +1,13 @@
 from flask import Blueprint, request, jsonify, send_file
 from .models import db, Resume
-from .resume_optimizer import extract_text_from_docx, optimize_resume
+from .resume_optimizer import optimize_resume 
+from .util import extract_text_from_docx
+from .resume_optimizer import optimize_resume 
+
 from .pdf_generator import save_text_as_pdf
 import os
 import uuid
 import logging
-
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -52,17 +54,31 @@ def optimize(resume_id):
     if not resume:
         return jsonify({"error": "Resume not found"}), 404
 
-    text = extract_text_from_docx(resume.original_path)
-    optimized_text = optimize_resume(text, job_desc)
+    try:
+        # Read resume content (assuming .docx format)
+        resume_text = extract_text_from_docx(resume.original_path)
 
-    optimized_path = os.path.join("optimized", f"{resume_id}.pdf")
-    save_text_as_pdf(optimized_text, optimized_path)
+        # Optimize resume
+        optimized_text, change_log = optimize_resume(resume_text, job_desc)
 
-    resume.optimized_path = optimized_path
-    resume.job_description = job_desc
-    db.session.commit()
+        # Save optimized resume to PDF
+        optimized_path = os.path.join("optimized", f"{resume_id}.pdf")
+        save_text_as_pdf(optimized_text, optimized_path)
 
-    return jsonify({"message": "Resume optimized", "resume_id": resume_id})
+        # Update DB record
+        resume.optimized_path = optimized_path
+        resume.job_description = job_desc
+        db.session.commit()
+
+        return jsonify({
+            "message": "Resume optimized successfully",
+            "resume_id": resume_id,
+            "optimized_resume_path": optimized_path,
+            "modifications": change_log  # Return what was changed
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Resume optimization failed: {str(e)}"}), 500
 
 @resume_bp.route("/download-resume/<resume_id>", methods=["GET"])
 def download_resume(resume_id):
