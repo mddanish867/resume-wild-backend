@@ -1,8 +1,29 @@
-flask
-flask_sqlalchemy
-flask_cors
-python-docx
+# PDF processing
 pdfkit
-transformers
-openai
 psycopg2-binary
+
+# Core Flask dependencies
+Flask
+Flask-SQLAlchemy
+Flask-CORS
+
+# Document processing
+python-docx
+docx2pdf
+reportlab
+
+# Machine Learning and NLP
+transformers
+torch
+scikit-learn
+nltk
+
+# Database
+SQLAlchemy
+
+# Utility libraries
+Werkzeug
+python-dotenv
+
+# PDF processing alternatives
+PyMuPDF
